@@ -29,6 +29,7 @@ const _suggestions = [
   'Quantas entregas faltam hoje?',
   'Quem está devendo para a gente?',
   'Tem estoque de cimento?',
+  'Cobrar por e-mail um cliente com boleto vencido',
 ];
 
 class _AssistantPageState extends State<AssistantPage> {
@@ -208,6 +209,24 @@ class _AssistantPageState extends State<AssistantPage> {
     }
     if (!mounted) return;
     FocusScope.of(context).unfocus();
+
+    // E-mail esperando confirmação: "pode enviar" envia, "cancela" descarta.
+    final pending = _pendingEmailTurn;
+    if (pending != null && (isSendConfirmation(text) || isSendCancel(text))) {
+      setState(() {
+        _turns.add(ChatTurn.user(text));
+        _text.clear();
+        _live = '';
+      });
+      _scrollDown();
+      if (isSendConfirmation(text)) {
+        await _sendEmail(pending);
+      } else {
+        await _cancelEmail(pending);
+      }
+      return;
+    }
+
     final history = [for (final t in _turns) t.toHistory()];
     setState(() {
       _turns.add(ChatTurn.user(text));
@@ -253,6 +272,59 @@ class _AssistantPageState extends State<AssistantPage> {
     if (!mounted) return;
     // Mãos livres: depois de falar, já ouve a próxima pergunta.
     if (_voiceOn && _mode == _Mode.idle) await _startListening();
+  }
+
+  ChatTurn? get _pendingEmailTurn {
+    for (final t in _turns.reversed) {
+      if (!t.user && t.email != null) {
+        return t.emailStatus == EmailStatus.pending ? t : null;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _sendEmail(ChatTurn turn) async {
+    final draft = turn.email;
+    if (draft == null || turn.emailStatus != EmailStatus.pending) return;
+    await _stopVoice();
+    setState(() => turn.emailStatus = EmailStatus.sending);
+    try {
+      await _api.sendEmail(draft);
+      if (!mounted) return;
+      setState(() => turn.emailStatus = EmailStatus.sent);
+      final msg = 'Pronto, enviei o e-mail para ${draft.to}.';
+      setState(() => _turns.add(
+          ChatTurn.assistant(AssistantAnswer(reply: msg, sources: ['E-mail']))));
+      _scrollDown();
+      await _say(msg);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => turn.emailStatus = EmailStatus.pending);
+      showError(context, e);
+    }
+  }
+
+  Future<void> _cancelEmail(ChatTurn turn) async {
+    if (turn.emailStatus != EmailStatus.pending) return;
+    setState(() => turn.emailStatus = EmailStatus.cancelled);
+    const msg = 'Tudo bem, não enviei o e-mail.';
+    setState(() => _turns.add(
+        ChatTurn.assistant(const AssistantAnswer(reply: msg))));
+    _scrollDown();
+    await _say(msg);
+  }
+
+  Future<void> _editEmail(ChatTurn turn) async {
+    final draft = turn.email;
+    if (draft == null) return;
+    await _speech.cancel();
+    await _stopVoice();
+    if (!mounted) return;
+    final edited = await showDialog<EmailDraft>(
+      context: context,
+      builder: (_) => _EmailEditDialog(draft: draft),
+    );
+    if (edited != null && mounted) setState(() => turn.email = edited);
   }
 
   void _scrollDown() {
@@ -363,6 +435,9 @@ class _AssistantPageState extends State<AssistantPage> {
                             : _Bubble(
                                 turn: _turns[i],
                                 onReplay: (t) => _say(t, force: true),
+                                onSendEmail: _sendEmail,
+                                onCancelEmail: _cancelEmail,
+                                onEditEmail: _editEmail,
                               ),
                       ),
           ),
@@ -467,7 +542,16 @@ class _ThinkingBubble extends StatelessWidget {
 class _Bubble extends StatelessWidget {
   final ChatTurn turn;
   final ValueChanged<String> onReplay;
-  const _Bubble({required this.turn, required this.onReplay});
+  final ValueChanged<ChatTurn> onSendEmail;
+  final ValueChanged<ChatTurn> onCancelEmail;
+  final ValueChanged<ChatTurn> onEditEmail;
+  const _Bubble({
+    required this.turn,
+    required this.onReplay,
+    required this.onSendEmail,
+    required this.onCancelEmail,
+    required this.onEditEmail,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -538,6 +622,14 @@ class _Bubble extends StatelessWidget {
                       ]),
                     ),
                 ]),
+              ),
+            if (turn.email != null)
+              _EmailCard(
+                draft: turn.email!,
+                status: turn.emailStatus,
+                onSend: () => onSendEmail(turn),
+                onCancel: () => onCancelEmail(turn),
+                onEdit: () => onEditEmail(turn),
               ),
             Row(children: [
               if (a.sources.isNotEmpty)
@@ -644,6 +736,191 @@ class _InputBar extends StatelessWidget {
           Text(hint, style: theme.textTheme.bodySmall),
         ]),
       ),
+    );
+  }
+}
+
+/// Rascunho do e-mail de cobrança, com Enviar / Editar / Cancelar.
+class _EmailCard extends StatefulWidget {
+  final EmailDraft draft;
+  final EmailStatus status;
+  final VoidCallback onSend;
+  final VoidCallback onCancel;
+  final VoidCallback onEdit;
+  const _EmailCard({
+    required this.draft,
+    required this.status,
+    required this.onSend,
+    required this.onCancel,
+    required this.onEdit,
+  });
+
+  @override
+  State<_EmailCard> createState() => _EmailCardState();
+}
+
+class _EmailCardState extends State<_EmailCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final d = widget.draft;
+    final st = widget.status;
+    return Container(
+      margin: const EdgeInsets.only(top: 8, right: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        border: Border.all(color: scheme.outlineVariant),
+        borderRadius: BorderRadius.circular(10),
+        color: scheme.surface,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(Icons.mail_outline, size: 18, color: scheme.primary),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('E-mail de cobrança',
+                  style: theme.textTheme.labelLarge),
+            ),
+            if (st == EmailStatus.sent)
+              const Chip(
+                  label: Text('Enviado'),
+                  avatar: Icon(Icons.check, size: 16),
+                  visualDensity: VisualDensity.compact),
+            if (st == EmailStatus.cancelled)
+              const Chip(
+                  label: Text('Cancelado'),
+                  visualDensity: VisualDensity.compact),
+          ]),
+          const SizedBox(height: 6),
+          Text('Para: ${d.customerName.isEmpty ? '' : '${d.customerName} '}<${d.to}>',
+              style: theme.textTheme.bodySmall),
+          Text('Assunto: ${d.subject}',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: Text(
+              d.body,
+              maxLines: _expanded ? null : 4,
+              overflow: _expanded ? null : TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall,
+            ),
+          ),
+          if (st == EmailStatus.pending || st == EmailStatus.sending) ...[
+            const SizedBox(height: 8),
+            Wrap(spacing: 8, runSpacing: 4, children: [
+              FilledButton.icon(
+                onPressed: st == EmailStatus.sending ? null : widget.onSend,
+                icon: st == EmailStatus.sending
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.send, size: 18),
+                label: const Text('Enviar'),
+              ),
+              OutlinedButton(
+                onPressed: st == EmailStatus.sending ? null : widget.onEdit,
+                child: const Text('Editar'),
+              ),
+              TextButton(
+                onPressed: st == EmailStatus.sending ? null : widget.onCancel,
+                child: const Text('Cancelar'),
+              ),
+            ]),
+            Text('Ou diga "pode enviar".', style: theme.textTheme.labelSmall),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _EmailEditDialog extends StatefulWidget {
+  final EmailDraft draft;
+  const _EmailEditDialog({required this.draft});
+
+  @override
+  State<_EmailEditDialog> createState() => _EmailEditDialogState();
+}
+
+class _EmailEditDialogState extends State<_EmailEditDialog> {
+  late String _to = widget.draft.to;
+  late final _subject = TextEditingController(text: widget.draft.subject);
+  late final _body = TextEditingController(text: widget.draft.body);
+
+  @override
+  void dispose() {
+    _subject.dispose();
+    _body.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final options = {
+      ...widget.draft.toOptions,
+      widget.draft.to,
+    }.toList();
+    return AlertDialog(
+      title: const Text('Editar e-mail'),
+      content: SizedBox(
+        width: 520,
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            DropdownButtonFormField<String>(
+              initialValue: _to,
+              isExpanded: true,
+              decoration: const InputDecoration(labelText: 'Para'),
+              items: [
+                for (final o in options)
+                  DropdownMenuItem(value: o, child: Text(o)),
+              ],
+              onChanged: (v) => setState(() => _to = v ?? _to),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _subject,
+              decoration: const InputDecoration(labelText: 'Assunto'),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _body,
+              minLines: 6,
+              maxLines: 14,
+              decoration: const InputDecoration(labelText: 'Mensagem'),
+            ),
+          ]),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Voltar'),
+        ),
+        FilledButton(
+          onPressed: () {
+            if (_subject.text.trim().isEmpty || _body.text.trim().isEmpty) {
+              return;
+            }
+            Navigator.pop(
+              context,
+              widget.draft.copyWith(
+                to: _to,
+                subject: _subject.text.trim(),
+                body: _body.text.trim(),
+              ),
+            );
+          },
+          child: const Text('Salvar'),
+        ),
+      ],
     );
   }
 }

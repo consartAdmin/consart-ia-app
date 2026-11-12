@@ -14,6 +14,10 @@ próxima pergunta (mãos livres).
   no ERP. O ERP usa o Claude (chave `ANTHROPIC_API_KEY` no Cloud Run) e
   consulta os módulos pelas rotas GET do próprio ERP, com o login do
   usuário. Só consulta: não cria, altera ou exclui nada.
+- **E-mail de cobrança:** peça "cobra o cliente X do boleto vencido". A Consart
+  prepara o e-mail (só para e-mails do cadastro do cliente) e ele só é enviado
+  depois que você toca em **Enviar** ou diz "pode enviar". O envio usa a conta
+  de e-mail do ERP (`POST /api/assistant/send-email`).
 - **Limite:** `ASSISTANT_DAILY_LIMIT` perguntas por usuário por dia (padrão 150).
 
 ## Build
