@@ -169,4 +169,10 @@ class ApiService {
         timeout: const Duration(seconds: 120));
     return AssistantAnswer.fromJson(_map(json));
   }
+
+  /// Envia o e-mail de cobrança que o usuário confirmou.
+  Future<void> sendEmail(EmailDraft draft) async {
+    await _send('POST', '/api/assistant/send-email',
+        body: draft.toRequestJson(), timeout: const Duration(seconds: 60));
+  }
 }
